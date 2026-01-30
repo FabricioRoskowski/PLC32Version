@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <Update.h>
 
 /* ======================================================
    WIFI
@@ -11,12 +13,15 @@
 /* ======================================================
    THINGSBOARD MQTT BASIC
 ====================================================== */
-#define TB_SERVER     "192.168.0.25"     // IP do ThingsBoard
+#define TB_SERVER     "192.168.0.25"
 #define TB_PORT       1883
 
 #define MQTT_CLIENT_ID "ybfdbatzp3k0qpdjf16g"
 #define MQTT_USERNAME  "frj58cin41bme5d395oa"
 #define MQTT_PASSWORD  "il7h6b96g79tpjlz1i7h"
+
+
+String CURRENT_FW_VERSION = "1.1";
 
 /* ======================================================
    OBJETOS
@@ -25,25 +30,38 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 /* ======================================================
+   OTA VARIÁVEIS
+====================================================== */
+String fw_title;
+String fw_version;
+String fw_url;
+
+/* ======================================================
    PROTÓTIPOS
 ====================================================== */
 void connectWiFi();
 void connectMQTT();
 void sendTelemetry();
 void mqttCallback(char* topic, byte* payload, unsigned int length);
+void processAttributes(String json);
+void checkForOTA();
+void performOTA(String url);
+
 /* ======================================================
    SETUP
 ====================================================== */
 void setup() {
 
   Serial.begin(115200);
-  delay(1000);
+
+  pinMode(5, OUTPUT);
+  pinMode(18, OUTPUT);
+  pinMode(2, INPUT);
 
   connectWiFi();
 
   client.setServer(TB_SERVER, TB_PORT);
   client.setCallback(mqttCallback);
-
 }
 
 /* ======================================================
@@ -58,7 +76,7 @@ void loop() {
   client.loop();
 
   sendTelemetry();
-  delay(2000);   // envia a cada 2 segundos
+  delay(2000);
 }
 
 /* ======================================================
@@ -76,7 +94,6 @@ void connectWiFi() {
   }
 
   Serial.println("\nWiFi conectado!");
-  Serial.print("IP ESP32: ");
   Serial.println(WiFi.localIP());
 }
 
@@ -88,18 +105,20 @@ void connectMQTT() {
   while (!client.connected()) {
 
     Serial.print("Conectando ao ThingsBoard...");
-  
 
     if (client.connect(
           MQTT_CLIENT_ID,
           MQTT_USERNAME,
           MQTT_PASSWORD
         )) {
-    client.subscribe("v1/devices/me/rpc/request/+");
-      Serial.println("Conectado!");
+
+      client.subscribe("v1/devices/me/rpc/request/+");
+      client.subscribe("v1/devices/me/attributes");
+      client.publish("v1/devices/me/attributes/request/1", "{}");
+      Serial.println("OK");
     }
     else {
-      Serial.print("Falhou rc=");
+      Serial.print("Falha rc=");
       Serial.println(client.state());
       delay(2000);
     }
@@ -107,13 +126,13 @@ void connectMQTT() {
 }
 
 /* ======================================================
-   ENVIO TELEMETRIA
+   TELEMETRIA
 ====================================================== */
 void sendTelemetry() {
 
   float temperatura = random(200, 350) / 10.0;
   float umidade     = random(400, 800) / 10.0;
-  int   estadoIO    = digitalRead(2);
+  int estadoIO = digitalRead(2);
 
   StaticJsonDocument<128> json;
 
@@ -126,20 +145,27 @@ void sendTelemetry() {
 
   client.publish("v1/devices/me/telemetry", payload);
 
-  Serial.print("Enviado: ");
   Serial.println(payload);
 }
+
+/* ======================================================
+   CALLBACK MQTT
+====================================================== */
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   String msg;
+  for (int i = 0; i < length; i++) msg += (char)payload[i];
 
-  for (int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
-
-  Serial.print("RPC recebido: ");
+  Serial.print("Msg: ");
   Serial.println(msg);
 
+  // ---- ATRIBUTOS OTA ----
+  if (String(topic).indexOf("attributes") >= 0) {
+    processAttributes(msg);
+    return;
+  }
+
+  // ---- RPC ----
   StaticJsonDocument<200> doc;
   deserializeJson(doc, msg);
 
@@ -153,4 +179,70 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   if (strcmp(metodo, "setRelay2") == 0) {
     digitalWrite(18, valor ? HIGH : LOW);
   }
+}
+
+/* ======================================================
+   PROCESSA ATRIBUTOS OTA
+====================================================== */
+void processAttributes(String json) {
+
+  StaticJsonDocument<256> doc;
+  deserializeJson(doc, json);
+
+  if (doc["fw_title"])   fw_title   = doc["fw_title"].as<String>();
+  if (doc["fw_version"]) fw_version = doc["fw_version"].as<String>();
+  if (doc["fw_url"])     fw_url     = doc["fw_url"].as<String>();
+
+  Serial.println("Firmware recebido:");
+  Serial.println(fw_title);
+  Serial.println(fw_version);
+  Serial.println(fw_url);
+
+  checkForOTA();
+}
+
+/* ======================================================
+   VERIFICA OTA
+====================================================== */
+void checkForOTA() {
+
+  if (fw_version.length() == 0) return;
+
+  if (fw_version != CURRENT_FW_VERSION) {
+    Serial.println("Nova versao encontrada!");
+    performOTA(fw_url);
+  }
+}
+
+
+/* ======================================================
+   EXECUTA OTA
+====================================================== */
+void performOTA(String url) {
+
+  Serial.println("Baixando firmware...");
+  Serial.println(url);
+
+  HTTPClient http;
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+
+    int len = http.getSize();
+    WiFiClient* stream = http.getStreamPtr();
+
+    if (Update.begin(len)) {
+
+      size_t written = Update.writeStream(*stream);
+
+      if (written == len && Update.end()) {
+
+        Serial.println("Update OK. Reiniciando...");
+        ESP.restart();
+      }
+    }
+  }
+
+  http.end();
 }
